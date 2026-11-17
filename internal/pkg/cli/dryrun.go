@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,11 +14,13 @@ import (
 
 	"github.com/docker/go-units"
 	"go.podman.io/image/v5/types"
+	"k8s.io/apimachinery/pkg/util/sets"
 
 	"github.com/openshift/oc-mirror/v2/internal/pkg/api/v2alpha1"
 	"github.com/openshift/oc-mirror/v2/internal/pkg/archive"
 	"github.com/openshift/oc-mirror/v2/internal/pkg/consts"
 	"github.com/openshift/oc-mirror/v2/internal/pkg/emoji"
+	"github.com/openshift/oc-mirror/v2/internal/pkg/history"
 	"github.com/openshift/oc-mirror/v2/internal/pkg/image"
 	"github.com/openshift/oc-mirror/v2/internal/pkg/imagebuilder"
 	"github.com/openshift/oc-mirror/v2/internal/pkg/mirror"
@@ -374,14 +377,6 @@ func (s *sizeEstimate) addError(image string, issues ...error) {
 // estimateDryRunSize keeps cache availability and archive history independent.
 func (o *ExecutorSchema) estimateDryRunSize(ctx context.Context, cs v2alpha1.CollectorSchema, results map[string]imageSizeResult) dryRunSizeReport {
 	report := dryRunSizeReport{ImageCount: len(dedupeImagesBySource(cs.AllImages))}
-	archiveBlobs := make(map[string][]types.BlobInfo, len(results))
-	for source, result := range results {
-		archiveBlobs[source] = result.Blobs
-		report.TarballSize.addError(source, result.Errors...)
-	}
-	if len(results) < report.ImageCount {
-		report.TarballSize.addError("images", errors.New("image inspection did not finish"))
-	}
 	checker := o.blobExists
 	if checker == nil {
 		var close func()
@@ -400,10 +395,7 @@ func (o *ExecutorSchema) estimateDryRunSize(ctx context.Context, cs v2alpha1.Col
 	report.TotalDownloadSize = o.computeSizeReport(ctx, downloads, results, checker)
 	cacheResults := o.cacheSizeResults(ctx, cache, results)
 	report.LocalStorageSize = o.computeSizeReport(ctx, cache, cacheResults, checker)
-	if !o.Opts.IsMirrorToDisk() {
-		report.TarballSize = sizeEstimate{}
-	}
-	o.completeSizeReport(ctx, cs, cache, archiveBlobs, cacheResults, &report)
+	o.completeSizeReport(ctx, cs, cache, results, cacheResults, &report)
 	return report
 }
 
@@ -465,14 +457,18 @@ func (s *sizeEstimate) addMissing(source string, result imageSizeResult, scope s
 	s.addError(source, result.Errors...)
 }
 
-func (o *ExecutorSchema) completeSizeReport(ctx context.Context, cs v2alpha1.CollectorSchema, cacheImages []v2alpha1.CopyImageSchema, blobs map[string][]types.BlobInfo, results map[string]imageSizeResult, report *dryRunSizeReport) {
-	metadata := o.estimateCacheMetadata(cacheImages, results, &report.LocalStorageSize)
+func (o *ExecutorSchema) completeSizeReport(ctx context.Context, cs v2alpha1.CollectorSchema, cacheImages []v2alpha1.CopyImageSchema, selected, cacheResults map[string]imageSizeResult, report *dryRunSizeReport) {
+	metadata, metadataErr := o.estimateCacheMetadata(cacheImages, selected, cacheResults, &report.LocalStorageSize)
 	if o.Opts.IsMirrorToDisk() {
-		var err error
-		report.TarballSize.Bytes, err = archive.EstimateSize(ctx, o.Opts, o.LocalStorageDisk, cs, blobs, metadata, o.Config.ArchiveSize, o.Log)
+		archived, err := o.readSizeHistory(ctx)
+		report.TarballSize = roughTarballSize(ctx, cs.AllImages, selected, archived, metadata)
 		if err != nil {
 			report.TarballSize.Unavailable = true
-			report.TarballSize.addError("archive", err)
+			report.TarballSize.addError("archive history", err)
+		}
+		if metadataErr != nil {
+			report.TarballSize.Unavailable = true
+			report.TarballSize.addError("archive metadata", metadataErr)
 		}
 	}
 	for catalog, filtered := range cs.CatalogToFBCMap {
@@ -484,6 +480,82 @@ func (o *ExecutorSchema) completeSizeReport(ctx context.Context, cs v2alpha1.Col
 			}
 		}
 	}
+}
+
+// readSizeHistory reads one selected history file, without enumerating archive
+// contents or appending history. Keep this sequential: history owns a package logger.
+func (o *ExecutorSchema) readSizeHistory(ctx context.Context) (sets.Set[string], error) {
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("read size history: %w", err)
+	}
+	h, err := history.NewHistory(o.Opts.Global.WorkingDir, o.Opts.Global.Since, o.Log, history.OSFileCreator{})
+	if err != nil {
+		return nil, fmt.Errorf("initialize size history: %w", err)
+	}
+	archived, err := h.Read()
+	if err != nil && !errors.Is(err, &history.EmptyHistoryError{}) {
+		return nil, fmt.Errorf("read size history: %w", err)
+	}
+	return archived, nil
+}
+
+type sizeInventory struct {
+	Bytes, Files int64
+}
+
+// roughTarballSize uses only already inspected descriptors and predicted selected
+// links. It deliberately does no I/O, cache filtering or archive construction.
+// Working files, ISC and unrelated cache metadata are not inventoried.
+func roughTarballSize(ctx context.Context, images []v2alpha1.CopyImageSchema, results map[string]imageSizeResult, archived sets.Set[string], metadata sizeInventory) sizeEstimate {
+	estimate := sizeEstimate{Bytes: archive.AddSize(metadata.Bytes, 1024)}
+	files := metadata.Files
+	seen := sets.New[string]()
+	for _, img := range dedupeImagesBySource(images) {
+		if ctx.Err() != nil {
+			break
+		}
+		result, ok := results[img.Source]
+		if !ok {
+			estimate.addError(img.Source, errors.New("source could not be sized"))
+			continue
+		}
+		estimate.addError(img.Source, result.Errors...)
+		for _, blob := range result.Blobs {
+			if ctx.Err() != nil {
+				break
+			}
+			if seen.Has(blob.Digest.String()) {
+				continue
+			}
+			seen.Insert(blob.Digest.String())
+			// Record membership separately from history so shared descriptors and
+			// their sizing issues are considered only once across all sources.
+			if err := blob.Digest.Validate(); err != nil {
+				estimate.addError(img.Source, fmt.Errorf("invalid blob digest: %w", err))
+				continue
+			}
+			if blob.Size < 0 {
+				estimate.addError(img.Source, fmt.Errorf("unknown size for %s", blob.Digest))
+				continue
+			}
+			if archived.Has(blob.Digest.String()) {
+				continue
+			}
+			estimate.Bytes = archive.AddSize(estimate.Bytes, blob.Size)
+			files = archive.AddSize(files, 1)
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		estimate.Unavailable = true
+		estimate.addError("archive inventory", err)
+	}
+	// Saturate the coarse per-entry framing allowance before multiplying.
+	if files > math.MaxInt64/3072 {
+		estimate.Bytes = math.MaxInt64
+	} else {
+		estimate.Bytes = archive.AddSize(estimate.Bytes, files*3072)
+	}
+	return estimate
 }
 
 // inspectSignatureSizes reuses the existing inspector and sigstore tag naming.
@@ -545,22 +617,44 @@ func (o *ExecutorSchema) cachedBlobExists(blob types.BlobInfo) (bool, error) {
 	return true, nil
 }
 
-func (o *ExecutorSchema) estimateCacheMetadata(images []v2alpha1.CopyImageSchema, results map[string]imageSizeResult, estimate *sizeEstimate) map[string]int64 {
+func (o *ExecutorSchema) estimateCacheMetadata(images []v2alpha1.CopyImageSchema, selected, cacheResults map[string]imageSizeResult, estimate *sizeEstimate) (sizeInventory, error) {
+	var inventory sizeInventory
 	if len(images) == 0 {
-		return nil
-	}
-	if o.LocalStorageDisk == "" {
-		estimate.addError("cache", errors.New("local cache path is unavailable"))
-		return nil
+		return inventory, nil
 	}
 	blobs := make(map[string][]types.BlobInfo, len(images))
 	for _, img := range images {
-		blobs[img.Source] = results[img.Source].Blobs
+		blobs[img.Source] = selected[img.Source].Blobs
 	}
 	metadata, err := archive.CacheMetadata(images, blobs)
 	if err != nil {
 		estimate.addError("cache metadata", err)
-		return nil
+		return inventory, err
+	}
+	// Reuse the link prediction needed for local storage, counting full selected
+	// lengths before any presence/growth checks. History never filters links.
+	for _, size := range metadata {
+		inventory.Bytes = archive.AddSize(inventory.Bytes, size)
+		inventory.Files++
+	}
+	// Only rebuilt OCI catalogs need a distinct, unfiltered prediction for local
+	// storage. Do not leak those extra platforms into the selected inventory.
+	for _, img := range images {
+		if img.RebuiltTag != "" && strings.HasPrefix(img.Source, consts.OciProtocolTrimmed) {
+			for source, result := range cacheResults {
+				blobs[source] = result.Blobs
+			}
+			metadata, err = archive.CacheMetadata(images, blobs)
+			if err != nil {
+				estimate.addError("cache metadata", err)
+				return inventory, nil
+			}
+			break
+		}
+	}
+	if o.LocalStorageDisk == "" {
+		estimate.addError("cache", errors.New("local cache path is unavailable"))
+		return inventory, nil
 	}
 	for path, size := range metadata {
 		info, err := os.Stat(filepath.Join(o.LocalStorageDisk, path))
@@ -575,7 +669,7 @@ func (o *ExecutorSchema) estimateCacheMetadata(images []v2alpha1.CopyImageSchema
 			estimate.Bytes = archive.AddSize(estimate.Bytes, size-info.Size())
 		}
 	}
-	return metadata
+	return inventory, nil
 }
 
 func (o *ExecutorSchema) logSizeReport(report dryRunSizeReport) {
@@ -583,6 +677,9 @@ func (o *ExecutorSchema) logSizeReport(report dryRunSizeReport) {
 	o.logSizeEstimate("Total Download Size", report.TotalDownloadSize)
 	o.logSizeEstimate("Local Storage Size", report.LocalStorageSize)
 	o.logSizeEstimate("Tarball Size", report.TarballSize)
+	if o.Opts != nil && o.Opts.IsMirrorToDisk() {
+		o.Log.Info("Tarball Size is rough: selected blobs and repository links only; excludes working-dir (including catalog layouts), image set configuration and unrelated cached metadata. Not a peak-disk guarantee.")
+	}
 	o.Log.Info("Images: %d", report.ImageCount)
 }
 

@@ -147,7 +147,7 @@ var _ = Describe("dry-run", func() {
 			fullTar := expectDryRunMetricBytes(result, "Tarball Size")
 			Expect(fullTar).To(BeNumerically(">=", warmTar+coldDownload), "cached blobs absent from history must still be archived")
 
-			By("including operator-catalog files only in the tarball estimate")
+			By("explicitly omitting working-directory catalog files from the rough tarball estimate")
 			catalogDir := filepath.Join(workDir, dirWorkingDir, "operator-catalogs")
 			Expect(os.MkdirAll(catalogDir, 0o755)).To(Succeed())
 			catalog := make([]byte, 1024*1024)
@@ -156,7 +156,8 @@ var _ = Describe("dry-run", func() {
 			expectOcMirrorCommandSuccess(result, err)
 			Expect(expectDryRunMetricBytes(result, "Total Download Size")).To(BeZero())
 			Expect(expectDryRunMetricBytes(result, "Local Storage Size")).To(BeZero())
-			Expect(expectDryRunMetricBytes(result, "Tarball Size")).To(BeNumerically(">=", fullTar+int64(len(catalog))))
+			Expect(expectDryRunMetricBytes(result, "Tarball Size")).To(Equal(fullTar))
+			Expect(result.Stdout + result.Stderr).To(ContainSubstring("excludes working-dir (including catalog layouts)"))
 		})
 	})
 

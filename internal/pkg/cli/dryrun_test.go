@@ -1248,12 +1248,15 @@ func TestIncrementalCacheAndHistoryAreIndependent(t *testing.T) {
 				require.Equal(t, wantDownload+int64(len(blob.Digest.String())), report.LocalStorageSize.Bytes)
 				require.Empty(t, report.TarballSize.Errors)
 				require.False(t, report.TarballSize.Unavailable)
-				empty, err := archive.EstimateSize(context.Background(), ex.Opts, ex.LocalStorageDisk, v2alpha1.CollectorSchema{}, nil, nil, 0, ex.Log)
-				require.NoError(t, err)
+				wantTar := int64(len(blob.Digest.String())) + 3072 + 1024
 				if archived {
-					require.Less(t, report.TarballSize.Bytes-empty, blob.Size)
+					require.Equal(t, wantTar, report.TarballSize.Bytes)
+					ex.Opts.Global.Since = time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
+					older := ex.estimateDryRunSize(context.Background(), cs, results)
+					require.Equal(t, wantDownload, older.TotalDownloadSize.Bytes)
+					require.Equal(t, wantTar+blob.Size+3072, older.TarballSize.Bytes)
 				} else {
-					require.Greater(t, report.TarballSize.Bytes-empty, blob.Size)
+					require.Equal(t, wantTar+blob.Size+3072, report.TarballSize.Bytes)
 				}
 			})
 		}
@@ -1291,6 +1294,12 @@ func TestIncrementalM2MScopesDownloadsAndCachesCatalogs(t *testing.T) {
 		require.Equal(t, blob.Size+otherPlatform.Size+2*int64(len(blob.Digest.String())), report.LocalStorageSize.Bytes)
 		require.Zero(t, report.TotalDownloadSize.Bytes, "locally generated catalog content is not downloaded")
 		require.Equal(t, []types.BlobInfo{blob}, selected[rebuilt.Source].Blobs, "cache sizing must preserve the selected-platform inventory")
+		ex.Opts.Mode = mirror.MirrorToDisk
+		report = ex.estimateDryRunSize(context.Background(), v2alpha1.CollectorSchema{AllImages: []v2alpha1.CopyImageSchema{rebuilt}}, selected)
+		require.Empty(t, report.TarballSize.Errors)
+		require.Equal(t, blob.Size+int64(len(blob.Digest.String()))+2*3072+1024, report.TarballSize.Bytes,
+			"rough archive must not include unselected rebuilt platforms or their links")
+		require.Equal(t, blob.Size+otherPlatform.Size+2*int64(len(blob.Digest.String())), report.LocalStorageSize.Bytes)
 	})
 }
 

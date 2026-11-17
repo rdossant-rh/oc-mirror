@@ -5,10 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
-	"maps"
 	"os"
 	"path/filepath"
-	"slices"
 	"time"
 
 	digest "github.com/opencontainers/go-digest"
@@ -100,7 +98,7 @@ func (o *MirrorArchive) BuildArchive(ctx context.Context, schema v2alpha1.Collec
 	return nil
 }
 
-// addContents is shared by archive creation and its metadata-only estimate.
+// addContents gathers the contents for archive creation.
 func (o *MirrorArchive) addContents(ctx context.Context, schema v2alpha1.CollectorSchema, onBlobsGathered func()) (sets.Set[string], error) {
 	// 1 - Add files and directories under the cache's docker/v2/repositories to the archive
 	repositoriesDir := filepath.Join(o.cacheDir, cacheRepositoriesDir)
@@ -316,49 +314,4 @@ func addTagMetadata(files map[string]int64, root, tag string, d digest.Digest) {
 	tags := filepath.Join(root, "_manifests", "tags", tag)
 	files[filepath.Join(tags, "current", "link")] = int64(len(d.String()))
 	files[filepath.Join(tags, "index", d.Algorithm().String(), d.Encoded(), "link")] = int64(len(d.String()))
-}
-
-// EstimateSize predicts a new archive without copying blobs or updating history.
-// Its filesystem inputs are a snapshot; catalogs must be prepared beforehand,
-// and files generated or changed later can alter the final archive size.
-func EstimateSize(ctx context.Context, opts *mirror.CopyOptions, cacheDir string, schema v2alpha1.CollectorSchema, blobsBySource map[string][]types.BlobInfo, cacheMetadata map[string]int64, archiveSize int64, logger clog.PluggableLoggerInterface) (int64, error) {
-	archiver, err := NewMirrorArchive(opts, "", opts.Global.ConfigPath, opts.Global.WorkingDir, cacheDir, archiveSize, logger)
-	if err != nil {
-		return 0, err
-	}
-	metadata, err := CacheMetadata(schema.AllImages, blobsBySource)
-	if err != nil {
-		return 0, err
-	}
-	maps.Copy(metadata, cacheMetadata)
-	counter := &sizeAdder{maxSize: archiver.maxSize, strict: opts.Global.StrictArchiving, total: 1024, files: make(map[string]bool), pending: make(map[string]int64)}
-	for name, size := range metadata {
-		counter.pending[filepath.Join(cacheDir, name)] = size
-	}
-	gathered := make(map[string]sets.Set[string])
-	for _, img := range schema.AllImages {
-		if gathered[img.Destination] == nil {
-			gathered[img.Destination] = sets.New[string]()
-		}
-		for _, blob := range blobsBySource[img.Source] {
-			path, err := BlobPath(cacheDir, blob.Digest)
-			if err != nil {
-				return 0, err
-			}
-			counter.pending[path] = blob.Size
-			gathered[img.Destination].Insert(blob.Digest.String())
-		}
-	}
-	counter.pendingPaths = slices.Sorted(maps.Keys(counter.pending))
-	archiver.adder = counter
-	archiver.blobGatherer = descriptorGatherer(gathered)
-	_, err = archiver.addContents(ctx, schema, nil)
-	return counter.total, err
-}
-
-// Adapt the already inspected descriptors to the existing archive selection.
-type descriptorGatherer map[string]sets.Set[string]
-
-func (g descriptorGatherer) GatherBlobs(_ context.Context, destination string, _ []string) (sets.Set[string], error) {
-	return g[destination], nil
 }
